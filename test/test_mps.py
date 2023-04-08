@@ -578,6 +578,7 @@ def mps_ops_modifier(ops):
         'nn.functional.max_unpool1dgrad': None,
         'nn.functional.max_unpool2dgrad': None,
         'nn.functional.max_unpool3dgrad': None,
+        'nn.functional.avg_pool2d': [torch.float16],
         'nn.functional.avg_pool3d': None,
         'nn.functional.ctc_loss': None,
         'nn.functional.embedding_bag': None,
