@@ -442,7 +442,7 @@ def _pre_forward_unshard(
     with torch.profiler.record_function(
         "FullyShardedDataParallel._pre_forward_prefetch"
     ):
-        _prefetch_handle(state, handle, _PrefetchMode.FORWARD)
+        _prefetch_next_handle(state, handle, _PrefetchMode.FORWARD)
 
 
 @no_type_check
@@ -686,7 +686,7 @@ def _pre_backward_hook(
         with torch.profiler.record_function(
             "FullyShardedDataParallel._pre_backward_prefetch"
         ):
-            _prefetch_handle(state, handle, _PrefetchMode.BACKWARD)
+            _prefetch_next_handle(state, handle, _PrefetchMode.BACKWARD)
         handle.prepare_gradient_for_backward()
         handle._ran_pre_backward_hook = True
 
@@ -779,7 +779,7 @@ def _post_backward_reshard(
     with torch.profiler.record_function(
         "FullyShardedDataParallel._post_backward_prefetch"
     ):
-        _prefetch_handle(state, handle, _PrefetchMode.BACKWARD)
+        _prefetch_next_handle(state, handle, _PrefetchMode.BACKWARD)
 
 
 @no_type_check
@@ -1172,7 +1172,7 @@ def _finalize_params(
 
 
 @no_type_check
-def _prefetch_handle(
+def _prefetch_next_handle(
     state: _FSDPState,
     current_handle: Optional[FlatParamHandle],
     prefetch_mode: _PrefetchMode,
