@@ -166,6 +166,8 @@ def _maybe_insert_input_observers_for_node(
     # Clone has memory_format kwarg that persist in exported graph
     # this is just a work around for that.
     assert (
+        node.target == torch.ops.aten.empty.memory_format or
+        node.target == torch.ops.aten.new_zeros.default or
         node.target == torch.ops.aten.clone.default or len(node.kwargs) == 0
     ), " expecting kwargs for aten op IR to be empty"
 

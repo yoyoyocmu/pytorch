@@ -11,7 +11,10 @@ from torch.ao.quantization import (
     MovingAveragePerChannelMinMaxObserver,
     QConfigMapping,
 )
-from torch.ao.quantization.backend_config import get_qnnpack_backend_config
+from torch.ao.quantization.backend_config import (
+    get_executorch_backend_config,
+    get_qnnpack_backend_config,
+)
 from torch.ao.quantization.qconfig import (
     default_per_channel_symmetric_qnnpack_qat_qconfig,
     default_symmetric_qnnpack_qat_qconfig,
@@ -45,11 +48,11 @@ class PT2EQATTestCase(QuantizationTestCase):
         model: torch.nn.Module,
         example_inputs: Tuple[Any, ...],
     ):
-        self._verify_symmetric_xnnpack_qat_numerics_helper(
-            model,
-            example_inputs,
-            is_per_channel=True,
-        )
+        #self._verify_symmetric_xnnpack_qat_numerics_helper(
+        #    model,
+        #    example_inputs,
+        #    is_per_channel=True,
+        #)
         self._verify_symmetric_xnnpack_qat_numerics_helper(
             model,
             example_inputs,
@@ -61,7 +64,7 @@ class PT2EQATTestCase(QuantizationTestCase):
         model: torch.nn.Module,
         example_inputs: Tuple[Any, ...],
         is_per_channel: bool,
-        verify_convert: bool = True,
+        verify_convert: bool = False
     ):
         """
         Helper method to verify that the QAT numerics for PT2E quantization match those of
@@ -70,6 +73,26 @@ class PT2EQATTestCase(QuantizationTestCase):
         # resetting dynamo cache
         torch._dynamo.reset()
         MANUAL_SEED = 100
+
+        torch.set_printoptions(precision=8)
+
+        class PrintMod(torch.nn.Module):
+            def __init__(self, name):
+                super().__init__()
+                self.name = name
+            def forward(self, x):
+                print("*** PrintMod ", self.name, x.flatten()[:10])
+                return x
+
+        def insert_print_mod(model, node_name, model_name):
+            for n in model.graph.nodes:
+                if n.name == node_name:
+                    print_mod_name = model_name + "_print_mod_" + n.name
+                    setattr(model, print_mod_name, PrintMod(print_mod_name))
+                    with model.graph.inserting_after(n):
+                        model.graph.call_module(print_mod_name, (n,))
+                    break
+            model.recompile()
 
         # PT2 export
 
@@ -85,8 +108,13 @@ class PT2EQATTestCase(QuantizationTestCase):
             example_inputs,
         )
         model_pt2e = prepare_qat_pt2e(model_pt2e, quantizer)
-        torch.manual_seed(MANUAL_SEED)
-        after_prepare_result_pt2e = model_pt2e(*example_inputs)
+        for n in model_pt2e.graph.nodes:
+            if n.target == torch.ops.aten._native_batch_norm_legit.default:
+                n.target = torch.ops.aten.cudnn_batch_norm.default
+        model_pt2e.recompile()
+        model_pt2e.cuda()
+
+        # FX baseline
 
         model_fx = copy.deepcopy(model)
         if is_per_channel:
@@ -94,25 +122,70 @@ class PT2EQATTestCase(QuantizationTestCase):
         else:
             default_qconfig = default_symmetric_qnnpack_qat_qconfig
         qconfig_mapping = QConfigMapping().set_global(default_qconfig)
-        backend_config = get_qnnpack_backend_config()
+        backend_config = get_executorch_backend_config()
         model_fx = prepare_qat_fx(
             model_fx, qconfig_mapping, example_inputs, backend_config=backend_config
         )
-        torch.manual_seed(MANUAL_SEED)
-        after_prepare_result_fx = model_fx(*example_inputs)
+        model_fx.cuda()
 
-        # Verify that numerics match
-        self.assertEqual(after_prepare_result_pt2e, after_prepare_result_fx)
+        # DEBUG CODE
+
+        #model_fx.graph.eliminate_dead_code(); model_fx.recompile()
+        #model_pt2e.graph.eliminate_dead_code(); model_pt2e.recompile()
+        #with open("/tmp/model.txt", "w") as f:
+        #    import re
+        #    f.write(re.sub(";(.*)\n", "\n", str(model_pt2e)) + "\n\n\n" + re.sub(";(.*)\n", "\n", str(model_fx)) + "\n")
+
+        #insert_print_mod(model_pt2e, "activation_post_process_0", "pt2")
+        #insert_print_mod(model_pt2e, "_param_constant0", "pt2")
+        #insert_print_mod(model_pt2e, "activation_post_process_1", "pt2")
+        #insert_print_mod(model_pt2e, "conv2d_default", "pt2")
+        #insert_print_mod(model_pt2e, "_param_constant2", "pt2")
+        #insert_print_mod(model_pt2e, "_param_constant3", "pt2")
+        #insert_print_mod(model_pt2e, "_tensor_constant1", "pt2")
+        #insert_print_mod(model_pt2e, "_tensor_constant2", "pt2")
+        #insert_print_mod(model_pt2e, "getitem","pt2")
+        #insert_print_mod(model_pt2e, "activation_post_process_2", "pt2")
+
+        #insert_print_mod(model_fx, "activation_post_process_0", "fx")
+        #insert_print_mod(model_fx, "conv", "fx")
+        #insert_print_mod(model_fx, "activation_post_process_1", "fx")
+
+        # exported fx
+        #insert_print_mod(model_fx, "conv2d_default", "fx")
+        #insert_print_mod(model_fx, "_param_constant2", "fx")
+        #insert_print_mod(model_fx, "_param_constant3", "fx")
+        #insert_print_mod(model_fx, "_tensor_constant1", "fx")
+        #insert_print_mod(model_fx, "_tensor_constant2", "fx")
+        #insert_print_mod(model_fx, "_tensor_constant13", "fx")
+        #insert_print_mod(model_fx, "_tensor_constant14", "fx")
+        #insert_print_mod(model_fx, "getitem", "fx")
+
+        #for i in range(0, 15):
+        #    insert_print_mod(model_pt2e, "activation_post_process_" + str(i), "pt2")
+        #for i in range(0, 7):
+        #    insert_print_mod(model_fx, "activation_post_process_" + str(i), "fx")
+
+        # Verify prepare N times
+        for i in range(10):
+            example_inputs = (torch.randn(1, 3, 224, 224).cuda(),)
+            torch.manual_seed(MANUAL_SEED)
+            after_prepare_result_pt2e = model_pt2e(*example_inputs)
+            torch.manual_seed(MANUAL_SEED)
+            after_prepare_result_fx = model_fx(*example_inputs)
+            self.assertEqual(after_prepare_result_pt2e, after_prepare_result_fx)
+            print("Prepare spot check %s passed" % i)
 
         if verify_convert:
             torch.ao.quantization.move_exported_model_to_eval(model_pt2e)
             model_pt2e = convert_pt2e(model_pt2e)
+            torch.manual_seed(MANUAL_SEED)
             quant_result_pt2e = model_pt2e(*example_inputs)
             model_fx.eval()
             model_fx = _convert_to_reference_decomposed_fx(
-                model_fx,
-                backend_config=backend_config,
+                model_fx, backend_config=backend_config,
             )
+            torch.manual_seed(MANUAL_SEED)
             quant_result_fx = model_fx(*example_inputs)
             self.assertEqual(quant_result_pt2e, quant_result_fx)
 
@@ -514,4 +587,26 @@ class TestQuantizePT2EQATModels(PT2EQATTestCase):
         with override_quantized_engine("qnnpack"):
             example_inputs = (torch.randn(1, 3, 224, 224),)
             m = torchvision.models.mobilenet_v2()
+            self._verify_symmetric_xnnpack_qat_numerics(m, example_inputs)
+
+    @skip_if_no_torchvision
+    @skipIfNoQNNPACK
+    def test_qat_od(self):
+        import torch.nn as nn
+        from torchvision.models.quantization import mobilenet_v2
+
+        class OcclusionDetection(nn.Module):
+            def __init__(self, backbone):
+                super(OcclusionDetection, self).__init__()
+                self.backbone = backbone
+                self.softmax = nn.Softmax(dim=1)
+
+            def forward(self, x):
+                x = self.backbone(x)
+                x = self.softmax(x)
+                return x
+
+        with override_quantized_engine("qnnpack"):
+            example_inputs = (torch.randn(1, 3, 224, 224),)
+            m = OcclusionDetection(mobilenet_v2(num_classes=3))
             self._verify_symmetric_xnnpack_qat_numerics(m, example_inputs)

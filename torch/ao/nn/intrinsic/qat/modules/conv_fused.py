@@ -96,9 +96,20 @@ class _ConvBnNd(nn.modules.conv._ConvNd, nni._FusedModule):
         return self
 
     def _forward(self, input):
-        if self._enable_slow_path_for_better_numerical_stability:
-            return self._forward_slow(input)
-        return self._forward_approximate(input)
+        return self._my_forward(input)
+        #if self._enable_slow_path_for_better_numerical_stability:
+        #    return self._forward_slow(input)
+        #return self._forward_approximate(input)
+
+    def _my_forward(self, x):
+        wfq = self.weight_fake_quant(self.weight)
+        #print("*** PrintFX conv weight ", self.weight.flatten()[:10])
+        #print("*** PrintFX conv weight fake quant", wfq.flatten()[:10])
+        x = self._conv_forward(x, wfq, self.bias)
+        #print("*** PrintFX conv output ", x.flatten()[:10])
+        x = self.bn(x)
+        #print("*** PrintFX bn output", x.flatten()[:10])
+        return x
 
     def _forward_approximate(self, input):
         """Approximated method to fuse conv and bn. It requires only one forward pass.
