@@ -320,6 +320,8 @@ class TorchHigherOrderOperatorVariable(VariableTracker):
             return CheckpointHigherOrderVariable(value, source, **kwargs)
         elif value.__name__ == "_export_tracepoint":
             return ExportTracepointHigherOrderVariable(value, source, **kwargs)
+        # elif value.__name__ == "_invoke_in_backward_op":
+        # return ExportTracepointHigherOrderVariable(value, source, **kwargs)
         else:
             unimplemented(f"HigherOrderOperator {value.__name__}")
 
