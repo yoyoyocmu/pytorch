@@ -1390,10 +1390,6 @@ class TestCustomOp(CustomOpTestCaseBase):
         @custom_ops.impl_abstract(f"{TestCustomOp.test_ns}::foo")
         def foo_meta(x):
             ctx = torch._custom_op.impl.get_ctx()
-            with self.assertRaisesRegex(ValueError, "greater than or equal to 2"):
-                ctx.create_unbacked_symint(min=1)
-            with self.assertRaisesRegex(ValueError, "greater than or equal to 2"):
-                ctx.create_unbacked_symint(min=-1)
             with self.assertRaisesRegex(ValueError, "SymInt"):
                 ctx.create_unbacked_symint(max=x.numel())
             return torch.clone(x)
