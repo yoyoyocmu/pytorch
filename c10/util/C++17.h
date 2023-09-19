@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -35,6 +36,18 @@
  */
 
 namespace c10 {
+
+// in c++17 std::result_of has been superceded by std::invoke_result.  Since
+// c++20, std::result_of is removed.
+template <typename F, typename... args>
+#if defined(__cpp_lib_is_invocable) && __cpp_lib_is_invocable >= 201703L
+using invoke_result = typename std::invoke_result<F, args...>;
+#else
+using invoke_result = typename std::result_of<F && (args && ...)>;
+#endif
+
+template <typename F, typename... args>
+using invoke_result_t = typename invoke_result<F, args...>::type;
 
 // std::is_pod is deprecated in C++20, std::is_standard_layout and
 // std::is_trivial are introduced in C++11, std::conjunction has been introduced
@@ -93,6 +106,24 @@ struct negation : bool_constant<!bool(B::value)> {};
 
 #endif
 
+#ifdef __cpp_lib_void_t
+
+template <class T>
+using void_t = std::void_t<T>;
+
+#else
+
+// Implementation taken from http://en.cppreference.com/w/cpp/types/void_t
+// (it takes CWG1558 into account and also works for older compilers)
+template <typename... Ts>
+struct make_void {
+  typedef void type;
+};
+template <typename... Ts>
+using void_t = typename make_void<Ts...>::type;
+
+#endif
+
 #if defined(USE_ROCM)
 // rocm doesn't like the C10_HOST_DEVICE
 #define CUDA_HOST_DEVICE
@@ -147,6 +178,22 @@ CUDA_HOST_DEVICE constexpr decltype(auto) apply(F&& f, Tuple&& t) {
 
 #undef CUDA_HOST_DEVICE
 
+template <typename Functor, typename... Args>
+typename std::enable_if<
+    std::is_member_pointer<typename std::decay<Functor>::type>::value,
+    typename c10::invoke_result_t<Functor, Args...>>::type
+invoke(Functor&& f, Args&&... args) {
+  return std::mem_fn(std::forward<Functor>(f))(std::forward<Args>(args)...);
+}
+
+template <typename Functor, typename... Args>
+typename std::enable_if<
+    !std::is_member_pointer<typename std::decay<Functor>::type>::value,
+    typename c10::invoke_result_t<Functor, Args...>>::type
+invoke(Functor&& f, Args&&... args) {
+  return std::forward<Functor>(f)(std::forward<Args>(args)...);
+}
+
 namespace detail {
 struct _identity final {
   template <class T>
@@ -160,11 +207,21 @@ struct _identity final {
 
 template <class Func, class Enable = void>
 struct function_takes_identity_argument : std::false_type {};
+#if defined(_MSC_VER)
+// For some weird reason, MSVC shows a compiler error when using guts::void_t
+// instead of std::void_t. But we're only building on MSVC versions that have
+// std::void_t, so let's just use that one.
 template <class Func>
 struct function_takes_identity_argument<
     Func,
     std::void_t<decltype(std::declval<Func>()(_identity()))>> : std::true_type {
 };
+#else
+template <class Func>
+struct function_takes_identity_argument<
+    Func,
+    void_t<decltype(std::declval<Func>()(_identity()))>> : std::true_type {};
+#endif
 } // namespace detail
 
 } // namespace guts
