@@ -3,6 +3,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// WARNING: Be careful when adding new includes here. This header will be used
+// in model.so, and should not refer to any aten/c10 headers except the stable
+// C ABI defined in torch/csrc/inductor/aoti_torch/c/shim.h. The same rule
+// applies to other files under torch/csrc/inductor/aot_runtime/.
 #include <torch/csrc/inductor/aoti_torch/c/shim.h>
 
 #ifdef __GNUC__
@@ -33,9 +37,6 @@ using AOTInductorModelContainerHandle = AOTInductorModelContainerOpaque*;
 struct AOTInductorStreamOpaque;
 using AOTInductorStreamHandle = AOTInductorStreamOpaque*;
 
-struct AOTInductorTensorOpaque;
-using AOTInductorTensorHandle = AOTInductorTensorOpaque*;
-
 // Creates an AOTInductor model container. The parameter num_models
 // specifies the number of model instances that may be run concurrently for
 // the same input model.
@@ -52,9 +53,11 @@ AOTInductorError AOTInductorModelContainerDelete(
 // Runs the inference.
 AOTInductorError AOTInductorModelContainerRun(
     AOTInductorModelContainerHandle container_handle,
-    AOTInductorTensorHandle input_handles,
+    // Array of raw AtenTensorHandle for input tensors. Handles will be stolen
+    AtenTensorHandle* input_handles,
     size_t num_inputs,
-    AOTInductorTensorHandle output_handles,
+    // Array of raw AtenTensorHandle for output tensors. Handles will be stolen
+    AtenTensorHandle* output_handles,
     size_t num_outputs,
     AOTInductorStreamHandle stream_handle,
     AOTIProxyExecutorHandle proxy_executor_handle,
