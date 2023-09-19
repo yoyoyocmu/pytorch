@@ -24,14 +24,14 @@ std::vector<AtenTensorHandle> unsafe_alloc_new_handles_from_tensors(
   return result;
 }
 
-std::vector<at::Tensor> alloc_tensors_from_handles(
+std::vector<at::Tensor> alloc_tensors_by_stealing_from_handles(
     std::vector<AtenTensorHandle>& handles) {
   std::vector<at::Tensor> result;
   result.reserve(handles.size());
   for (auto handle : handles) {
-    auto tensor = *tensor_handle_to_tensor_pointer(handle);
-    result.emplace_back(std::move(tensor));
+    result.emplace_back(std::move(*tensor_handle_to_tensor_pointer(handle)));
   }
+  handles.clear();
   return result;
 }
 

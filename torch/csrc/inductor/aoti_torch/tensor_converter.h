@@ -22,11 +22,10 @@ TORCH_API AtenTensorHandle tensor_pointer_to_tensor_handle(at::Tensor* tensor);
 TORCH_API std::vector<AtenTensorHandle> unsafe_alloc_new_handles_from_tensors(
     std::vector<at::Tensor>& tensors);
 
-// alloc_tensors_from_handles is used for creating a vector of aten tensors.
-// It is only used in the non ABI compatible mode as a convenient utility
-// function to convert AtenTensorHandle into aten tensors that the default
-// codegen can understand.
-TORCH_API std::vector<at::Tensor> alloc_tensors_from_handles(
+// alloc_tensors_by_stealing_from_handles is used for creating a vector of aten
+// tensors by stealing from a vector of handles
+// WARNING: only used in the non ABI compatible mode
+TORCH_API std::vector<at::Tensor> alloc_tensors_by_stealing_from_handles(
     std::vector<AtenTensorHandle>& handles);
 
 } // namespace aot_inductor
