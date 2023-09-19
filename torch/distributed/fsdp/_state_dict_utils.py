@@ -39,6 +39,7 @@ from torch.distributed.fsdp._runtime_utils import (
 )
 from torch.distributed.fsdp.api import (
     FullStateDictConfig,
+    ShardedStateDictConfig,
     ShardingStrategy,
     StateDictType,
 )
@@ -616,7 +617,7 @@ def _sharded_pre_load_state_dict_hook(
 
         if not fsdp_state._state_dict_config._use_dtensor:
             # All-gather the param (ShardedTensor)
-            param, shards = _ext_pre_load_state_dict_transform(param)
+            param, shards = _ext_pre_load_state_dict_transform(param, fqn_from_global_root)
 
             assert len(shards) < 2, (
                 "Expects 0 or 1 shard per rank "
@@ -811,6 +812,13 @@ def _pre_load_state_dict_hook(
         context = contextlib.nullcontext()
 
     _lazy_init(fsdp_state, module)
+    # Workaround for https://github.com/pytorch/pytorch/issues/109648 - setting use_dtensor
+    # based on device_mesh. This issue similarly may need to be resolved for optim
+    # state_dict and a unittest should be added.
+    if getattr(module, "device_mesh", None) and isinstance(
+        module._state_dict_config, ShardedStateDictConfig
+    ):
+        module._state_dict_config._use_dtensor = True
     if fsdp_state._is_root:
         SimpleProfiler.reset()
 
