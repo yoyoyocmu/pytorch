@@ -20,7 +20,7 @@ def get_tensor_id(tensor):
 class NestedTensor(torch.Tensor):
     _values: torch.Tensor  # type: ignore[assignment]
     _offsets: torch.Tensor
-    _size: Tuple[int, int, int]
+    _size: Tuple[int, ...]
 
     __torch_function__ = torch._C._disabled_torch_function_impl
 
@@ -57,16 +57,14 @@ class NestedTensor(torch.Tensor):
         assert offsets is not None
         assert offsets.ndim == 1
         assert not isinstance(values, NestedTensor)
-        assert values.ndim == 2
 
         # In a later PR, we'll need to accept an additional size argument
         # to handle dynamic shapes.
         ragged_dim = get_tensor_id(offsets)
-        D = values.shape[1]
+        Ds = values.shape[1:]
         B = offsets.shape[0] - 1
-        self._size = (B, ragged_dim, D)
+        self._size = (B, ragged_dim, *Ds)
         self._offsets = offsets
-        return
 
     def values(self):
         return self._values
@@ -81,7 +79,17 @@ class NestedTensor(torch.Tensor):
         )
         if self.grad_fn:
             grad_fn_str = f", grad_fn={self.grad_fn}"
-        return f"NestedTensor(size={self._size}, offsets={self.offsets}{grad_fn_str})"
+        return f"NestedTensor(size={self._size}, offsets={self._offsets}{grad_fn_str})"
+
+    def __reduce_ex__(self, proto):
+        state = torch._utils._get_obj_state(self)
+        # SymNodes are not serializable
+        if "_size" in state:
+            state = dict(state)
+            del state["_size"]
+        func = NestedTensor
+        args = (self._values, self._offsets)
+        return (torch._tensor._rebuild_from_type_v2, (func, type(self), args, state))
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
@@ -94,7 +102,7 @@ class NestedTensor(torch.Tensor):
         if fn is not None:
             return fn(*args, **kwargs)
 
-        raise NotImplementedError
+        raise NotImplementedError(f"{str(func)}")
 
 
 # Not actually a view!
@@ -128,7 +136,7 @@ def jagged_from_list(
     """Constructs a NestedTensor backed by jagged layout from a list of tensors"""
     assert len(set(t.dtype for t in tensors)) == 1  # noqa: C401
     assert len(set(t.device for t in tensors)) == 1  # noqa: C401
-    assert all(t.ndim == 2 for t in tensors)
+    # TODO: Expand this check across all dims but the first
     assert len(set(t.shape[1] for t in tensors)) == 1  # noqa: C401
 
     lengths = torch.tensor([t.shape[0] for t in tensors])
