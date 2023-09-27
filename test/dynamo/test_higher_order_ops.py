@@ -1,6 +1,6 @@
 # Owner(s): ["module: dynamo"]
-import contextlib
 import functools
+import re
 import unittest
 
 import functorch.experimental.control_flow as control_flow
@@ -19,7 +19,7 @@ from torch._dynamo.testing import (
     EagerAndRecordGraphs,
     normalize_gm,
 )
-from torch._dynamo.utils import counters
+from torch._dynamo.utils import counters, ifdynstaticdefault
 from torch._higher_order_ops.wrap import wrap
 from torch.testing._internal.inductor_utils import HAS_CUDA
 
@@ -74,14 +74,31 @@ def op_count(gm):
     return result
 
 
-@contextlib.contextmanager
-def disable_functorch_capture():
-    org_val = torch._dynamo.config.capture_func_transforms
-    torch._dynamo.config.capture_func_transforms = False
-    try:
-        yield
-    finally:
-        torch._dynamo.config.capture_func_transforms = org_val
+# Checks that a dict matches a dict with "regex keys". That is,
+# the keys are regex expressions.
+def assert_dict_matches_regex(self, dct, dct_with_regex_keys):
+    regex_keys = dct_with_regex_keys.keys()
+    regex_key_to_actual_key = {}
+    for regex_key in regex_keys:
+        for key in dct:
+            if re.match(regex_key, key):
+                if regex_key in regex_key_to_actual_key:
+                    raise AssertionError(
+                        f"Single key regex mapped to multiple keys. Please improve your "
+                        f"regex. Got: regex='{regex_key}' "
+                        f"keys='{regex_key_to_actual_key[regex_key]}',"
+                        f"'{key}'"
+                    )
+                regex_key_to_actual_key[regex_key] = key
+    new_dct = {}
+    for regex_key in regex_keys:
+        if regex_key not in regex_key_to_actual_key:
+            raise AssertionError(
+                f"Got regex '{regex_key}' but could not match any key in dict with "
+                f"keys {dct.keys()}"
+            )
+        new_dct[regex_key_to_actual_key[regex_key]] = dct_with_regex_keys[regex_key]
+    self.assertEqual(dct, new_dct)
 
 
 class HigherOrderOpTests(torch._dynamo.test_case.TestCase):
@@ -103,7 +120,14 @@ class HigherOrderOpTests(torch._dynamo.test_case.TestCase):
 
         self.assertEqual(result, expected)
 
-    def _test_wrap_simple(self, func, args, expected_num_wrap_args, expected_opcount=1):
+    def _test_wrap_simple(
+        self,
+        func,
+        args,
+        expected_num_wrap_args,
+        expected_opcount=1,
+        return_graph=False,
+    ):
         # Given a `func` that has a single call to `wrap`,
         # we check that:
         # - there are no graph breaks
@@ -121,8 +145,29 @@ class HigherOrderOpTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cnt.op_count, expected_opcount)
 
         self.assertEqual(len(backend.graphs), 1)
-        wrap_node = find_first_node(backend.graphs[0], wrap)
+        graph = backend.graphs[0]
+        wrap_node = find_first_node(graph, wrap)
         self.assertEqual(len(wrap_node.args), expected_num_wrap_args)
+        if return_graph:
+            return normalize_gm(graph.print_readable(print_output=False))
+
+    def test_error_message_sane(self):
+        foo = []
+
+        def inner(x):
+            foo.append(x)
+            return x.clone()
+
+        @torch.compile(backend="eager", fullgraph=True)
+        def f(x):
+            return wrap(inner, x)
+
+        x = torch.randn(3)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "while introspecting wrap, we were unable to trace function `inner`",
+        ):
+            f(x)
 
     def test_no_freevars(self):
         def f(x):
@@ -181,6 +226,136 @@ class HigherOrderOpTests(torch._dynamo.test_case.TestCase):
 
         x = torch.randn(3)
         self._test_wrap_simple(f, (x,), 3)
+
+    def test_symint_input(self):
+        def f(x):
+            i = x.size(0)
+            return wrap(lambda x, i: x.view(i), x, i)
+
+        x = torch.randn(3, 1)
+        self._test_wrap_simple(
+            f, (x,), ifdynstaticdefault(2, 3), expected_opcount=ifdynstaticdefault(1, 2)
+        )
+
+    def test_wrap_pytree_args_nested(self):
+        def f(x, y, z):
+            def fn(d):
+                return d["x"].sin() + d["y"][0].cos() - d["y"][1][2].sin()
+
+            return wrap(fn, d)
+
+        x = torch.tensor(1.5)
+        y = torch.tensor(2.0)
+        z = torch.tensor(3.0)
+        d = {"x": x, "y": (y, [x, y, z])}
+        actual_graph = self._test_wrap_simple(
+            f,
+            (x, y, z),
+            4,
+            return_graph=True,
+        )
+        self.assertExpectedInline(
+            actual_graph,
+            """\
+class GraphModule(torch.nn.Module):
+    def forward(self, L_x_ : torch.Tensor, L_y_ : torch.Tensor, L_z_ : torch.Tensor):
+        l_x_ = L_x_
+        l_y_ = L_y_
+        l_z_ = L_z_
+
+        wrap_body_0 = self.wrap_body_0
+        wrap = torch._higher_order_ops.wrap.wrap(wrap_body_0, l_x_, l_y_, l_z_);  wrap_body_0 = l_x_ = l_y_ = l_z_ = None
+        return (wrap,)
+
+    class GraphModule(torch.nn.Module):
+        def forward(self, l_x_, l_y_, l_z_):
+            sin = l_x_.sin();  l_x_ = None
+            cos = l_y_.cos();  l_y_ = None
+            add = sin + cos;  sin = cos = None
+            sin_1 = l_z_.sin();  l_z_ = None
+            sub = add - sin_1;  add = sin_1 = None
+            return sub
+""",
+        )
+
+    def test_wrap_pytree_args_with_symint_constant(self):
+        def f(x, y):
+            i = x.size(0)
+            return wrap(lambda t: t[0].view(t[2]) + t[1], (x, y, i))
+
+        x = torch.randn(3, 1)
+        y = 0.5
+        actual_graph = self._test_wrap_simple(
+            f,
+            (x, y),
+            ifdynstaticdefault(2, 3),
+            expected_opcount=ifdynstaticdefault(1, 2),
+            return_graph=True,
+        )
+        if torch._dynamo.config.assume_static_by_default:
+            self.assertExpectedInline(
+                actual_graph,
+                """\
+class GraphModule(torch.nn.Module):
+    def forward(self, L_x_ : torch.Tensor):
+        l_x_ = L_x_
+
+        wrap_body_0 = self.wrap_body_0
+        wrap = torch._higher_order_ops.wrap.wrap(wrap_body_0, l_x_);  wrap_body_0 = l_x_ = None
+        return (wrap,)
+
+    class GraphModule(torch.nn.Module):
+        def forward(self, l_x_):
+            view = l_x_.view(3);  l_x_ = None
+            add = view + 0.5;  view = None
+            return add
+""",
+            )
+        else:
+            self.assertExpectedInline(
+                actual_graph,
+                """\
+class GraphModule(torch.nn.Module):
+    def forward(self, s0 : torch.SymInt, L_x_ : torch.Tensor):
+        l_x_ = L_x_
+
+        size = l_x_.size(0)
+
+        wrap_body_0 = self.wrap_body_0
+        wrap = torch._higher_order_ops.wrap.wrap(wrap_body_0, l_x_, size);  wrap_body_0 = l_x_ = size = None
+        return (wrap,)
+
+    class GraphModule(torch.nn.Module):
+        def forward(self, l_x_, size):
+            view = l_x_.view(size);  l_x_ = size = None
+            add = view + 0.5;  view = None
+            return add
+""",
+            )
+
+    def test_wrap_pytree_kwargs(self):
+        def f(x, y, z):
+            def fn(*, x, y, z):
+                z1, z2 = z
+                return (x * 2) + y + z1
+
+            return wrap(fn, x=x, y=y, z=z)
+
+        x = torch.randn(3)
+        y = torch.randn(3, 3)
+        self._test_wrap_simple(f, (x, y, (x, y)), 3)
+
+    def test_wrap_pytree_args_not_const_symint_tensor(self):
+        class MyClass:
+            def __init__(self, x):
+                self.val = x
+
+        def f(x, y):
+            return wrap(lambda z: z[0].sin() * z[1].val.cos(), (x, y))
+
+        x = torch.tensor(1.2)
+        y = MyClass(torch.tensor(3.4))
+        self._assert_wrap_fallback(f, (x, y))
 
     def test_capture_constants(self):
         x = torch.randn(3, 3)
@@ -756,19 +931,7 @@ class HigherOrderOpTests(torch._dynamo.test_case.TestCase):
         x = torch.randn(3)
         y = 8
 
-        # When running with dynamic shapes, `y` is captured as SymNodeVariable,
-        # which is not supported currently.
-        err_msg = "HigherOrderOperator with body that accepts non-Tensors as input"
-        err_ctx = (
-            self.assertRaisesRegex(torch._dynamo.exc.Unsupported, err_msg)
-            if check_dynamic_shape_capture()
-            else contextlib.nullcontext()
-        )
-
-        with err_ctx:
-            # int are not passed as argument and directly
-            # baked into the graph.
-            self._test_wrap_simple(f, (x, y), 2)
+        self._test_wrap_simple(f, (x, y), ifdynstaticdefault(2, 3))
 
     def test_wrap_all_kwarg(self):
         def f(y, x):
@@ -840,20 +1003,9 @@ class HigherOrderOpTests(torch._dynamo.test_case.TestCase):
         opt(x, y)
         self.assertEqual(counters["stats"]["calls_captured"], 1)
 
-        # When running with dynamic shapes, `z` is captured as SymNodeVariable,
-        # which is not supported currently.
-        err_msg = "HigherOrderOperator with body that accepts non-Tensors as input"
-        err_ctx = (
-            self.assertRaisesRegex(torch._dynamo.exc.Unsupported, err_msg)
-            if check_dynamic_shape_capture()
-            else contextlib.nullcontext()
-        )
-
-        with err_ctx:
-            # verify that we `do` recompile
-            output = opt(x, y, 8)
-            self.assertEqual(counters["stats"]["calls_captured"], 2)
-            self.assertEqual(output, 2 * x)
+        output = opt(x, y, 8)
+        self.assertEqual(counters["stats"]["calls_captured"], 2)
+        self.assertEqual(output, 2 * x)
 
     def test_wrap_kwarg_default_else_branch(self):
         def f(x, y, z):
@@ -868,32 +1020,7 @@ class HigherOrderOpTests(torch._dynamo.test_case.TestCase):
         x = torch.randn(3)
         y = torch.randn(3, 3)
 
-        # When running with dynamic shapes, `z` is captured as SymNodeVariable,
-        # which is not supported currently.
-        err_msg = "HigherOrderOperator with body that accepts non-Tensors as input"
-        err_ctx = (
-            self.assertRaisesRegex(torch._dynamo.exc.Unsupported, err_msg)
-            if check_dynamic_shape_capture()
-            else contextlib.nullcontext()
-        )
-
-        with err_ctx:
-            # expected_num_wrap_args = 2 because in this case,
-            # we take the `else` branch and `y` is not lifted.
-            self._test_wrap_simple(f, (x, y, 8), 2)
-
-    def test_wrap_unsupported_kwarg(self):
-        def f(x, y, z):
-            def fn(*, x, y, z):
-                z1, z2 = z
-                return (x * 2) + y + z1
-
-            return wrap(fn, x=x, y=y, z=z)
-
-        x = torch.randn(3)
-        y = torch.randn(3, 3)
-
-        self._assert_wrap_fallback(f, (x, y, (x, y)))
+        self._test_wrap_simple(f, (x, y, 8), 2)
 
     def test_map_subgraph_name_is_valid(self):
         backend = EagerAndRecordGraphs()
@@ -920,6 +1047,39 @@ class HigherOrderOpTests(torch._dynamo.test_case.TestCase):
         for name, _ in map_gm.named_modules():
             name_set.add(name)
         self.assertEqual(name_set, {"", "map_body_1.map_body_0", "map_body_1"})
+
+    def test_map_multi_return(self):
+        cnt = CompileCounter()
+
+        @torch.compile(backend=cnt)
+        def f(x):
+            return control_flow.map(lambda x: (x.sin(), x.sin()), x)
+
+        x = torch.randn(3)
+        result = f(x)
+        self.assertEqual(result, (x.sin(), x.sin()))
+        self.assertEqual(cnt.frame_count, 0)
+
+    def test_map_symint_input(self):
+        backend = EagerAndRecordGraphs()
+        cnt = CompileCounterWithBackend(backend)
+
+        def fn(x, y):
+            def inner(x, y):
+                return torch.sin(x + y)
+
+            return control_flow.map(inner, x, y.size(0))
+
+        x = torch.randn(3, 1)
+        y = torch.randn(3, 1)
+        compiled_fn = torch.compile(fn, backend=cnt, fullgraph=True)
+
+        ref = fn(x, y)
+        res = compiled_fn(x, y)
+
+        self.assertEqual(ref, res)
+        self.assertEqual(cnt.frame_count, 1)
+        self.assertEqual(cnt.op_count, ifdynstaticdefault(2, 3))
 
     def test_cond_subgraph_name_is_valid(self):
         backend = EagerAndRecordGraphs()
@@ -990,24 +1150,17 @@ class HigherOrderOpTests(torch._dynamo.test_case.TestCase):
         mod_for_compile = torch.compile(Foo(), backend=cnt, dynamic=True)
         mod_for_eager = Foo()
 
-        actual = mod_for_compile(torch.ones(6, 4))
-        ref = mod_for_eager(torch.ones(6, 4))
-        self.assertEqual(actual, ref)
+        with self.assertRaisesRegex(
+            torch._dynamo.exc.UncapturedHigherOrderOpError,
+            r"Cond doesn't work unless it is captured completely with torch.compile",
+        ):
+            mod_for_eager(torch.ones(6, 4))
 
-        actual = mod_for_compile(torch.ones(3, 4))
-        ref = mod_for_eager(torch.ones(3, 4))
-        self.assertEqual(actual, ref)
-
-        self.assertExpectedInline(
-            backend.graphs[0].code.strip(),
-            """\
-def forward(self, s0 : torch.SymInt, s1 : torch.SymInt, L_x_ : torch.Tensor):
-    l_x_ = L_x_
-    size = l_x_.size();  l_x_ = None
-    getitem = size[0];  size = None
-    gt = getitem > 4;  getitem = None
-    return (gt,)""",
-        )
+        with self.assertRaisesRegex(
+            torch._dynamo.exc.UncapturedHigherOrderOpError,
+            r"Cond doesn't work unless it is captured completely with torch.compile",
+        ):
+            mod_for_compile(torch.ones(3, 4))
 
     def test_cond_free_variable_in_both_branches(self):
         backend = EagerAndRecordGraphs()
@@ -1057,6 +1210,98 @@ def forward(self, s0 : torch.SymInt, s1 : torch.SymInt, L_x_ : torch.Tensor):
                     )
                     self.assertEqual(num_placeholders, 5)
 
+    def _check_simple_cond_graph(
+        self, fn, args, exp_graph, exp_true_graph, exp_false_graph
+    ):
+        backend = EagerAndRecordGraphs()
+        cnt = CompileCounterWithBackend(backend)
+        out = torch.compile(fn, backend=cnt, fullgraph=True)(*args)
+        self.assertEqual(out, fn(*args))
+        self.assertEqual(cnt.frame_count, 1)
+        self.assertEqual(len(backend.graphs), 1)
+
+        # Dynamic shapes produce a slightly different graph.
+        if check_dynamic_shape_capture():
+            return
+
+        gm = backend.graphs[0]
+        graph = gm.code.strip()
+        true_graph = gm.cond_true_0.code.strip()
+        false_graph = gm.cond_false_0.code.strip()
+        self.assertExpectedInline(graph, exp_graph)
+        self.assertExpectedInline(true_graph, exp_true_graph)
+        self.assertExpectedInline(false_graph, exp_false_graph)
+
+    def test_cond_branches_no_arguments(self):
+        def fn(x):
+            def true_fn():
+                return torch.sin(x)
+
+            def false_fn():
+                return torch.cos(x)
+
+            return control_flow.cond(x.sum() > 0, true_fn, false_fn, tuple())
+
+        exp_graph = """\
+def forward(self, L_x_ : torch.Tensor):
+    l_x_ = L_x_
+    sum_1 = l_x_.sum()
+    gt = sum_1 > 0;  sum_1 = None
+    cond_true_0 = self.cond_true_0
+    cond_false_0 = self.cond_false_0
+    cond = torch.ops.higher_order.cond(gt, cond_true_0, cond_false_0, [l_x_, l_x_]);  \
+gt = cond_true_0 = cond_false_0 = l_x_ = None
+    return (cond,)
+""".strip()
+        exp_true_graph = """\
+def forward(self, l_x_, l_x__false_branch):
+    sin = torch.sin(l_x_);  l_x_ = None
+    return sin
+""".strip()
+        exp_false_graph = """\
+def forward(self, l_x__true_branch, l_x_):
+    cos = torch.cos(l_x_);  l_x_ = None
+    return cos
+""".strip()
+        self._check_simple_cond_graph(
+            fn, (torch.randn(4, 5),), exp_graph, exp_true_graph, exp_false_graph
+        )
+
+    def test_cond_branches_no_arguments_no_closure(self):
+        def fn(x):
+            def true_fn():
+                return torch.ones(3, 4)
+
+            def false_fn():
+                return torch.ones(3, 4).sin()
+
+            return control_flow.cond(x.sum() > 0, true_fn, false_fn, tuple())
+
+        exp_graph = """\
+def forward(self, L_x_ : torch.Tensor):
+    l_x_ = L_x_
+    sum_1 = l_x_.sum();  l_x_ = None
+    gt = sum_1 > 0;  sum_1 = None
+    cond_true_0 = self.cond_true_0
+    cond_false_0 = self.cond_false_0
+    cond = torch.ops.higher_order.cond(gt, cond_true_0, cond_false_0, []);  gt = cond_true_0 = cond_false_0 = None
+    return (cond,)
+""".strip()
+        exp_true_graph = """\
+def forward(self):
+    ones = torch.ones(3, 4)
+    return ones
+""".strip()
+        exp_false_graph = """\
+def forward(self):
+    ones = torch.ones(3, 4)
+    sin = ones.sin();  ones = None
+    return sin
+""".strip()
+        self._check_simple_cond_graph(
+            fn, (torch.randn(4, 5),), exp_graph, exp_true_graph, exp_false_graph
+        )
+
     def test_cond_side_effect_in_one_branches(self):
         backend = EagerAndRecordGraphs()
         cnt = CompileCounterWithBackend(backend)
@@ -1079,16 +1324,21 @@ def forward(self, s0 : torch.SymInt, s1 : torch.SymInt, L_x_ : torch.Tensor):
 
                 return control_flow.cond(y, true_fn, false_fn, [x])
 
+        mod_for_eager = Foo()
         mod_for_compile = torch.compile(
             Foo(), backend=cnt, dynamic=True, fullgraph=False
         )
-        mod_for_eager = Foo()
+        with self.assertRaisesRegex(
+            torch._dynamo.exc.UncapturedHigherOrderOpError,
+            r"Cond doesn't work unless it is captured completely with torch.compile",
+        ):
+            mod_for_eager(torch.tensor(True), torch.tensor(5))
 
-        res = mod_for_compile(torch.tensor(True), torch.tensor(5))
-        res = mod_for_compile(torch.tensor(True), torch.tensor(5))
-
-        self.assertEqual(len(backend.graphs), 0)
-        self.assertEqual(res, mod_for_eager(torch.tensor(True), torch.tensor(5)))
+        with self.assertRaisesRegex(
+            torch._dynamo.exc.UncapturedHigherOrderOpError,
+            r"Cond doesn't work unless it is captured completely with torch.compile",
+        ):
+            mod_for_compile(torch.tensor(True), torch.tensor(5))
 
     def test_cond_with_constant_pred(self):
         def test(pred, x):
@@ -1248,10 +1498,11 @@ def forward(self, s0 : torch.SymInt, s1 : torch.SymInt, L_x_ : torch.Tensor):
 
         f(x)
         self.assertEqual(y, x)
-        self.assertEqual(
+        assert_dict_matches_regex(
+            self,
             dict(counters["graph_break"]),
             {
-                "HigherOrderOperator: Mutating a variable not in the current scope (SideEffects)": 1
+                r".*HigherOrderOperator: Mutating a variable not in the current scope \(SideEffects\)": 1
             },
         )
 
@@ -1350,9 +1601,10 @@ def forward(self, s0 : torch.SymInt, s1 : torch.SymInt, L_x_ : torch.Tensor):
         result = f(x)
         self.assertEqual(result, [1, torch.sin(x), 2.0])
         self.assertEqual(cnt.frame_count, 0)
-        self.assertEqual(
+        assert_dict_matches_regex(
+            self,
             dict(counters["graph_break"]),
-            {"HigherOrderOperator body's output must consist of tensors only": 1},
+            {".*HigherOrderOperator body's output must consist of tensors only": 1},
         )
 
     def test_fallback_on_nested_tuple_output(self):
@@ -1391,9 +1643,10 @@ def forward(self, s0 : torch.SymInt, s1 : torch.SymInt, L_x_ : torch.Tensor):
         result = f(x)
         self.assertEqual(result, [{"a": -x}])
         self.assertEqual(cnt.frame_count, 0)
-        self.assertEqual(
+        assert_dict_matches_regex(
+            self,
             dict(counters["graph_break"]),
-            {"HigherOrderOperator body's output must consist of tensors only": 1},
+            {".*torch.* op returned non-Tensor dict call_function": 1},
         )
 
     def test_access_module_attr(self):
@@ -1558,6 +1811,13 @@ def forward(self, s0 : torch.SymInt, s1 : torch.SymInt, L_x_ : torch.Tensor):
 
 
 class FuncTorchHigherOrderOpTests(torch._dynamo.test_case.TestCase):
+    def run(self, result=None):
+        # capture_func_transform will be set to False (for 2.1) till we
+        # support all transforms, so manually patch it to `True`` for
+        # testing on release branch.
+        with config.patch(capture_func_transforms=True):
+            super().run(result)
+
     def _compile_check(self, fn, inputs, fullgraph=True, graph_idx=0):
         backend = EagerAndRecordGraphs()
         actual = fn(*inputs)
@@ -2000,10 +2260,11 @@ class GraphModule(torch.nn.Module):
         actual = wrapper_fn(x)
         expected = torch.compile(wrapper_fn, backend="aot_eager", fullgraph=False)(x)
         self.assertEqual(len(counters["graph_break"]), 1)
-        self.assertEqual(
+        assert_dict_matches_regex(
+            self,
             dict(counters["graph_break"]),
             {
-                "HigherOrderOperator: Mutating a variable not in the current scope (replace_all)": 2
+                r".*HigherOrderOperator: Mutating a variable not in the current scope \(replace_all\)": 2
             },
         )
         self.assertEqual(actual, expected)
@@ -2025,9 +2286,10 @@ class GraphModule(torch.nn.Module):
             (x1, x2)
         )
         self.assertEqual(len(counters["graph_break"]), 1)
-        self.assertEqual(
+        assert_dict_matches_regex(
+            self,
             dict(counters["graph_break"]),
-            {"HigherOrderOperator with body that accepts non-Tensors as input": 2},
+            {".*HigherOrderOperator with body that accepts non-Tensors as input": 2},
         )
         self.assertEqual(actual, expected)
 
@@ -2076,7 +2338,7 @@ class GraphModule(torch.nn.Module):
     def test_grad_disable_capture(self):
         counters.clear()
 
-        with disable_functorch_capture():
+        with config.patch(capture_func_transforms=False):
             # We have verified above that this
             # function compiles
             def fn(x):
@@ -2132,14 +2394,14 @@ class GraphModule(torch.nn.Module):
         expected = """\
 class GraphModule(torch.nn.Module):
     def forward(self, L_x_ : torch.Tensor):
-        l_x_ = L_x_
+        child = L_x_
 
         _check_randomness_arg = torch._functorch.vmap._check_randomness_arg('error')
 
-        select = l_x_.select(0, 0)
+        select = child.select(0, 0)
         vmap_body_0 = self.vmap_body_0
         vmap_proxy = torch.func.vmap(vmap_body_0, (0,), 0, 'error');  vmap_body_0 = None
-        call = vmap_proxy.__call__(l_x_);  vmap_proxy = l_x_ = None
+        call = vmap_proxy.__call__(child);  vmap_proxy = child = None
         return (call,)
 
     class GraphModule(torch.nn.Module):
@@ -2168,14 +2430,14 @@ class GraphModule(torch.nn.Module):
         expected = """\
 class GraphModule(torch.nn.Module):
     def forward(self, L_x_ : torch.Tensor):
-        l_x_ = L_x_
+        child = L_x_
 
         _check_randomness_arg = torch._functorch.vmap._check_randomness_arg('error')
 
-        select = l_x_.select(0, 0)
+        select = child.select(0, 0)
         vmap_body_0 = self.vmap_body_0
         vmap_proxy = torch.func.vmap(vmap_body_0, (0,), 0, 'error');  vmap_body_0 = None
-        call = vmap_proxy.__call__(l_x_);  vmap_proxy = l_x_ = None
+        call = vmap_proxy.__call__(child);  vmap_proxy = child = None
         return (call,)
 
     class GraphModule(torch.nn.Module):
@@ -2205,15 +2467,15 @@ class GraphModule(torch.nn.Module):
         expected = """\
 class GraphModule(torch.nn.Module):
     def forward(self, L_x_ : torch.Tensor, L_y_ : torch.Tensor):
-        l_x_ = L_x_
+        child = L_x_
         l_y_ = L_y_
 
         _check_randomness_arg = torch._functorch.vmap._check_randomness_arg('error')
 
-        select = l_x_.select(0, 0)
+        select = child.select(0, 0)
         vmap_body_0 = self.vmap_body_0
         vmap_proxy = torch.func.vmap(vmap_body_0, (0, None), 0, 'error');  vmap_body_0 = None
-        call = vmap_proxy.__call__(l_x_, l_y_);  vmap_proxy = l_x_ = l_y_ = None
+        call = vmap_proxy.__call__(child, l_y_);  vmap_proxy = child = l_y_ = None
         return (call,)
 
     class GraphModule(torch.nn.Module):
@@ -2244,16 +2506,16 @@ class GraphModule(torch.nn.Module):
         expected = """\
 class GraphModule(torch.nn.Module):
     def forward(self, L_x_ : torch.Tensor, L_y_ : torch.Tensor):
-        l_x_ = L_x_
-        l_y_ = L_y_
+        child = L_x_
+        child_1 = L_y_
 
         _check_randomness_arg = torch._functorch.vmap._check_randomness_arg('error')
 
-        select = l_x_.select(0, 0)
-        select_1 = l_y_.select(1, 0)
+        select = child.select(0, 0)
+        select_1 = child_1.select(1, 0)
         vmap_body_0 = self.vmap_body_0
         vmap_proxy = torch.func.vmap(vmap_body_0, (0, 1), 0, 'error');  vmap_body_0 = None
-        call = vmap_proxy.__call__(l_x_, l_y_);  vmap_proxy = l_x_ = l_y_ = None
+        call = vmap_proxy.__call__(child, child_1);  vmap_proxy = child = child_1 = None
         return (call,)
 
     class GraphModule(torch.nn.Module):
@@ -2286,16 +2548,16 @@ class GraphModule(torch.nn.Module):
         expected = """\
 class GraphModule(torch.nn.Module):
     def forward(self, L_x_ : torch.Tensor, L_y_ : torch.Tensor):
-        l_x_ = L_x_
-        l_y_ = L_y_
+        child = L_x_
+        child_1 = L_y_
 
         _check_randomness_arg = torch._functorch.vmap._check_randomness_arg('error')
 
-        select = l_x_.select(0, 0)
-        select_1 = l_y_.select(1, 0)
+        select = child.select(0, 0)
+        select_1 = child_1.select(1, 0)
         vmap_body_0 = self.vmap_body_0
         vmap_proxy = torch.func.vmap(vmap_body_0, (0, 1), 0, 'error');  vmap_body_0 = None
-        call = vmap_proxy.__call__(l_x_, l_y_);  vmap_proxy = l_x_ = l_y_ = None
+        call = vmap_proxy.__call__(child, child_1);  vmap_proxy = child = child_1 = None
         return (call,)
 
     class GraphModule(torch.nn.Module):
@@ -2324,26 +2586,29 @@ class GraphModule(torch.nn.Module):
         expected = """\
 class GraphModule(torch.nn.Module):
     def forward(self, L_x_ : torch.Tensor, L_y_ : torch.Tensor):
-        l_x_ = L_x_
-        l_y_ = L_y_
+        child = L_x_
+        child_1 = L_y_
 
         _check_randomness_arg = torch._functorch.vmap._check_randomness_arg('error')
         _check_randomness_arg_1 = torch._functorch.vmap._check_randomness_arg('error')
 
-        select = l_x_.select(0, 0)
-        select_1 = l_y_.select(0, 0)
+        select = child.select(0, 0)
+        select_1 = child_1.select(0, 0)
         vmap_body_1 = self.vmap_body_1
         vmap_proxy = torch.func.vmap(vmap_body_1, (0, 0), 0, 'error');  vmap_body_1 = None
-        call = vmap_proxy.__call__(l_x_, l_y_);  vmap_proxy = l_x_ = l_y_ = None
+        call = vmap_proxy.__call__(child, child_1);  vmap_proxy = child = child_1 = None
         return (call,)
 
     class GraphModule(torch.nn.Module):
         def forward(self, select, select_1):
-            select_2 = select.select(1, 0)
-            select_3 = select_1.select(1, 0)
+            child = select
+            child_1 = select_1
+
+            select_2 = child.select(1, 0)
+            select_3 = child_1.select(1, 0)
             vmap_body_0 = self.vmap_body_0
             vmap_proxy = torch.func.vmap(vmap_body_0, (1, 1), 0, 'error');  vmap_body_0 = None
-            call = vmap_proxy.__call__(select, select_1);  vmap_proxy = select = select_1 = None
+            call = vmap_proxy.__call__(child, child_1);  vmap_proxy = child = child_1 = None
             return call
 
         class GraphModule(torch.nn.Module):
@@ -2371,23 +2636,25 @@ class GraphModule(torch.nn.Module):
 class GraphModule(torch.nn.Module):
     def forward(self, L_x_ : torch.Tensor, L_y_ : torch.Tensor):
         l_x_ = L_x_
-        l_y_ = L_y_
+        child = L_y_
 
         _check_randomness_arg = torch._functorch.vmap._check_randomness_arg('error')
         _check_randomness_arg_1 = torch._functorch.vmap._check_randomness_arg('error')
 
-        select = l_y_.select(0, 0)
+        select = child.select(0, 0)
         vmap_body_1 = self.vmap_body_1
         vmap_proxy = torch.func.vmap(vmap_body_1, (0, None), 0, 'error');  vmap_body_1 = None
-        call = vmap_proxy.__call__(l_y_, l_x_);  vmap_proxy = l_y_ = l_x_ = None
+        call = vmap_proxy.__call__(child, l_x_);  vmap_proxy = child = l_x_ = None
         return (call,)
 
     class GraphModule(torch.nn.Module):
         def forward(self, select, l_x_):
-            select_1 = select.select(0, 0)
+            child = select
+
+            select_1 = child.select(0, 0)
             vmap_body_0 = self.vmap_body_0
             vmap_proxy = torch.func.vmap(vmap_body_0, (0, None), 0, 'error');  vmap_body_0 = None
-            call = vmap_proxy.__call__(select, l_x_);  vmap_proxy = select = l_x_ = None
+            call = vmap_proxy.__call__(child, l_x_);  vmap_proxy = child = l_x_ = None
             return call
 
         class GraphModule(torch.nn.Module):
@@ -2413,14 +2680,14 @@ class GraphModule(torch.nn.Module):
         expected = """\
 class GraphModule(torch.nn.Module):
     def forward(self, L_x_ : torch.Tensor):
-        l_x_ = L_x_
+        child = L_x_
 
         _check_randomness_arg = torch._functorch.vmap._check_randomness_arg('error')
 
-        select = l_x_.select(0, 0)
+        select = child.select(0, 0)
         vmap_body_0 = self.vmap_body_0
         vmap_proxy = torch.func.vmap(vmap_body_0, (0,), 0, 'error');  vmap_body_0 = None
-        call = vmap_proxy.__call__(l_x_);  vmap_proxy = l_x_ = None
+        call = vmap_proxy.__call__(child);  vmap_proxy = child = None
         getitem = call[0]
         getitem_1 = call[1];  call = None
         return (getitem, getitem_1)
@@ -2449,14 +2716,14 @@ class GraphModule(torch.nn.Module):
         expected = """\
 class GraphModule(torch.nn.Module):
     def forward(self, L_x_ : torch.Tensor):
-        l_x_ = L_x_
+        child = L_x_
 
         _check_randomness_arg = torch._functorch.vmap._check_randomness_arg('error')
 
-        select = l_x_.select(0, 0)
+        select = child.select(0, 0)
         vmap_body_0 = self.vmap_body_0
         vmap_proxy = torch.func.vmap(vmap_body_0, (0,), (1, 0), 'error');  vmap_body_0 = None
-        call = vmap_proxy.__call__(l_x_);  vmap_proxy = l_x_ = None
+        call = vmap_proxy.__call__(child);  vmap_proxy = child = None
         getitem = call[0]
         getitem_1 = call[1];  call = None
         return (getitem, getitem_1)
@@ -2486,14 +2753,14 @@ class GraphModule(torch.nn.Module):
         expected = """\
 class GraphModule(torch.nn.Module):
     def forward(self, L_x_ : torch.Tensor):
-        l_x_ = L_x_
+        child = L_x_
 
         _check_randomness_arg = torch._functorch.vmap._check_randomness_arg('error')
 
-        select = l_x_.select(0, 0)
+        select = child.select(0, 0)
         vmap_body_0 = self.vmap_body_0
         vmap_proxy = torch.func.vmap(vmap_body_0, (0,), (1, 0), 'error');  vmap_body_0 = None
-        call = vmap_proxy.__call__(l_x_);  vmap_proxy = l_x_ = None
+        call = vmap_proxy.__call__(child);  vmap_proxy = child = None
         getitem = call[0]
         getitem_1 = call[1];  call = None
         return (getitem, getitem_1)
@@ -2540,9 +2807,10 @@ class GraphModule(torch.nn.Module):
         actual = fn(x, y)
         expected = torch.compile(fn, backend="aot_eager", fullgraph=False)(x, y)
         self.assertEqual(len(counters["graph_break"]), 1)
-        self.assertEqual(
+        assert_dict_matches_regex(
+            self,
             dict(counters["graph_break"]),
-            {"HigherOrderOperator with body that accepts non-Tensors as input": 2},
+            {".*HigherOrderOperator with body that accepts non-Tensors as input": 2},
         )
         self.assertEqual(actual, expected)
 
@@ -2563,10 +2831,11 @@ class GraphModule(torch.nn.Module):
         actual = wrapper_fn(x, y)
         expected = torch.compile(wrapper_fn, backend="aot_eager", fullgraph=False)(x, y)
         self.assertEqual(len(counters["graph_break"]), 1)
-        self.assertEqual(
+        assert_dict_matches_regex(
+            self,
             dict(counters["graph_break"]),
             {
-                "HigherOrderOperator: Mutating a variable not in the current scope (replace_all)": 2
+                r".*HigherOrderOperator: Mutating a variable not in the current scope \(replace_all\)": 2
             },
         )
         self.assertEqual(actual, expected)
@@ -2574,7 +2843,7 @@ class GraphModule(torch.nn.Module):
     def test_vmap_disable_capture(self):
         counters.clear()
 
-        with disable_functorch_capture():
+        with config.patch(capture_func_transforms=False):
             # We have verified above that this
             # function compiles
             def wrapper_fn(x):
@@ -2609,9 +2878,10 @@ class GraphModule(torch.nn.Module):
         actual = wrapper_fn(x)
         expected = torch.compile(wrapper_fn, backend="aot_eager", fullgraph=False)(x)
         self.assertEqual(len(counters["graph_break"]), 1)
-        self.assertEqual(
+        assert_dict_matches_regex(
+            self,
             dict(counters["graph_break"]),
-            {"Illegal getattr invocation stride in strict mode": 2},
+            {".*Illegal getattr invocation stride in strict mode": 2},
         )
         self.assertEqual(actual, expected)
 
@@ -2650,6 +2920,44 @@ class GraphModule(torch.nn.Module):
             dict(counters["graph_break"]),
             {"torch.func.vmap: out_dims is not an int or tuple variable.": 2},
         )
+
+    def test_vmap_new_tensor_in_body(self):
+        def fn(x):
+            return x + torch.ones(3)
+
+        def wrapper_fn(x):
+            return torch.func.vmap(fn)(x)
+
+        x = torch.randn(
+            3,
+        )
+        opt = torch.compile(wrapper_fn, backend="eager", fullgraph=True)
+        expected = wrapper_fn(x)
+        actual = opt(x)
+        self.assertEqual(expected, actual)
+
+    def test_vmap_new_tensor_unused_in_body(self):
+        def fn(x):
+            return torch.tensor(0.5)
+
+        def wrapper_fn(x):
+            return torch.func.vmap(fn)(x)
+
+        x = torch.randn(3)
+        opt = torch.compile(wrapper_fn, backend="eager", fullgraph=True)
+        expected = wrapper_fn(x)
+        actual = opt(x)
+        self.assertEqual(expected, actual)
+
+    def test_vmap_new_tensor_implicit_via_op(self):
+        def wrapper_fn(x):
+            return torch.func.vmap(lambda t: torch.add(t, 0.5))(x)
+
+        x = torch.randn(3)
+        opt = torch.compile(wrapper_fn, backend="eager", fullgraph=True)
+        expected = wrapper_fn(x)
+        actual = opt(x)
+        self.assertEqual(expected, actual)
 
 
 class ActivationCheckpointingTests(torch._dynamo.test_case.TestCase):
