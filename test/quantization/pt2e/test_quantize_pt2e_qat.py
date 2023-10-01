@@ -6,6 +6,7 @@ from typing import Any, Optional, Tuple
 import torch
 from torch._export import capture_pre_autograd_graph
 from torch.ao.quantization import (
+    get_default_qat_qconfig_mapping,
     FusedMovingAvgObsFakeQuantize,
     MovingAverageMinMaxObserver,
     MovingAveragePerChannelMinMaxObserver,
@@ -38,6 +39,48 @@ from torch.testing._internal.common_quantization import (
 from torch.testing._internal.common_quantized import override_quantized_engine
 
 
+def _get_default_qat_qnnpack_quantization_config():
+    from torch.ao.quantization.quantizer import QuantizationSpec
+    from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import QuantizationConfig
+    from torch.ao.quantization import (
+        FusedMovingAvgObsFakeQuantize,
+        MovingAverageMinMaxObserver,
+        PlaceholderObserver,
+    )
+    act_quantization_spec = QuantizationSpec(
+        dtype=torch.uint8,
+        quant_min=0,
+        quant_max=255,
+        qscheme=torch.per_tensor_affine,
+        is_dynamic=False,
+        observer_or_fake_quant_ctr=FusedMovingAvgObsFakeQuantize.with_args(
+          observer=MovingAverageMinMaxObserver
+        ),
+    )
+    weight_quantization_spec = QuantizationSpec(
+        dtype=torch.int8,
+        quant_min=-128,
+        quant_max=127,
+        qscheme=torch.per_tensor_symmetric,
+        ch_axis=0,
+        is_dynamic=False,
+        observer_or_fake_quant_ctr=FusedMovingAvgObsFakeQuantize.with_args(
+          observer=MovingAverageMinMaxObserver
+        ),
+    )
+    bias_quantization_spec = QuantizationSpec(
+        dtype=torch.float,
+        observer_or_fake_quant_ctr=PlaceholderObserver,
+    )
+    return QuantizationConfig(
+        act_quantization_spec,
+        act_quantization_spec,
+        weight_quantization_spec,
+        bias_quantization_spec,
+        is_qat=True,
+    )
+
+
 class PT2EQATTestCase(QuantizationTestCase):
     """
     Base QuantizationTestCase for PT2E QAT with some helper methods.
@@ -53,10 +96,16 @@ class PT2EQATTestCase(QuantizationTestCase):
         #    example_inputs,
         #    is_per_channel=True,
         #)
+        #self._verify_symmetric_xnnpack_qat_numerics_helper(
+        #    model,
+        #    example_inputs,
+        #    is_per_channel=False,
+        #)
         self._verify_symmetric_xnnpack_qat_numerics_helper(
             model,
             example_inputs,
             is_per_channel=False,
+            asymmetric=True,
         )
 
     def _verify_symmetric_xnnpack_qat_numerics_helper(
@@ -64,7 +113,8 @@ class PT2EQATTestCase(QuantizationTestCase):
         model: torch.nn.Module,
         example_inputs: Tuple[Any, ...],
         is_per_channel: bool,
-        verify_convert: bool = False
+        asymmetric: bool = False,
+        verify_convert: bool = False,
     ):
         """
         Helper method to verify that the QAT numerics for PT2E quantization match those of
@@ -97,12 +147,12 @@ class PT2EQATTestCase(QuantizationTestCase):
         # PT2 export
 
         model_pt2e = copy.deepcopy(model)
+        if asymmetric:
+            global_quantization_config = _get_default_qat_qnnpack_quantization_config()
+        else:
+            global_quantization_config = get_symmetric_quantization_config(is_per_channel=is_per_channel, is_qat=True)
         quantizer = XNNPACKQuantizer()
-        quantizer.set_global(
-            get_symmetric_quantization_config(
-                is_per_channel=is_per_channel, is_qat=True
-            )
-        )
+        quantizer.set_global(global_quantization_config)
         model_pt2e = capture_pre_autograd_graph(
             model_pt2e,
             example_inputs,
@@ -117,11 +167,14 @@ class PT2EQATTestCase(QuantizationTestCase):
         # FX baseline
 
         model_fx = copy.deepcopy(model)
-        if is_per_channel:
-            default_qconfig = default_per_channel_symmetric_qnnpack_qat_qconfig
+        if asymmetric:
+            qconfig_mapping = get_default_qat_qconfig_mapping("qnnpack")
         else:
-            default_qconfig = default_symmetric_qnnpack_qat_qconfig
-        qconfig_mapping = QConfigMapping().set_global(default_qconfig)
+            if is_per_channel:
+                default_qconfig = default_per_channel_symmetric_qnnpack_qat_qconfig
+            else:
+                default_qconfig = default_symmetric_qnnpack_qat_qconfig
+            qconfig_mapping = QConfigMapping().set_global(default_qconfig)
         backend_config = get_executorch_backend_config()
         model_fx = prepare_qat_fx(
             model_fx, qconfig_mapping, example_inputs, backend_config=backend_config
