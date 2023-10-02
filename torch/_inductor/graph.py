@@ -956,13 +956,12 @@ class GraphLowering(torch.fx.Interpreter):
         code, linemap = self.codegen()
         linemap = [(line_no, node.stack_trace) for line_no, node in linemap]
         key, path = PyCodeCache.write(code)
-        mod = PyCodeCache.load_by_key_path(key, path, linemap=linemap)
+        mod = PyCodeCache.load_by_key_path(
+            key, path, linemap=linemap, attrs=self.constants
+        )
         self.cache_key = key
         self.cache_path = path
         self.cache_linemap = linemap
-
-        for name, value in self.constants.items():
-            setattr(mod, name, value)
 
         # Logged twice as per https://github.com/pytorch/pytorch/pull/99038#discussion_r1167826029
         # TODO. Revisit this once the logging API is more mature
