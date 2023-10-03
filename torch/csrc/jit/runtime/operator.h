@@ -129,11 +129,9 @@ struct TORCH_API Operator {
     return op_.fold<Operation>(
         [](const C10Operator& op) { return op.op_; },
         [node](const JitOnlyOperator& op) {
-          std::cout << "Op outer" << std::endl;
           return op.op_.fold<Operation>(
               [](const Operation& op) { return op; },
               [node](const OperationCreator& op_creator) {
-                std::cout << "Op creator" << std::endl;
                 return op_creator(node);
               });
         });
