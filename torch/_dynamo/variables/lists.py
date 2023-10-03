@@ -27,9 +27,14 @@ from .functions import UserFunctionVariable, UserMethodVariable
 
 
 def _listlike_contains_helper(items, search, tx, options):
+    def _get(item):
+        if isinstance(item, variables.NNModuleVariable):
+            return tx.output.get_submodule(item.module_key)
+        return item.as_python_constant()
+
     if search.is_python_constant():
         result = any(
-            x.as_python_constant() == search.as_python_constant() for x in items
+            _get(x) == _get(search) for x in items
         )
         return variables.ConstantVariable.create(result, **options)
 
