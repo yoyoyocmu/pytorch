@@ -746,15 +746,15 @@ class TensorVariable(VariableTracker):
                 if src:
                     tx.output.guards.add(src.make_guard(GuardBuilder.ID_MATCH))
 
-                if not compiled_autograd.compiled_autograd_enabled:
+                # if not compiled_autograd.compiled_autograd_enabled:
                     # TODO(voz):
                     # We can relax this by speculating the callable and ensuring that it doesn't modify arbitrary
                     # python state.
                     # We *Must* be in compiled_autograd here because backward hooks can contain anything, and it is unsafe to run
                     # them in a compiled bwd without re-entering dynamo as compiled_autograd does.
-                    unimplemented(
-                        "Compilation of intermediate hooks requires compiled autograd"
-                    )
+                    # unimplemented(
+                    #     "Compilation of intermediate hooks requires compiled autograd"
+                    # )
 
                 # This wraps our user provided fn with a function that intercedes and
                 # uses our `invoke` higher order op to record a hook invocation in bwd graph.
@@ -1208,8 +1208,8 @@ class TypedStorageVariable(VariableTracker):
             #         # **options,
             # )
             # return self.original
-            # self.value._resize_(args[0].value)
-            self.as_proxy()._resize_(args[0].value)
+            self.value._resize_(args[0].value)
+            # self.as_proxy()._resize_(args[0].value)
             # self.value().as_proxy()._resize_(args[0])
             # self.original.as_proxy()._typed_storage()._resize_(args[0].value)
             # with torch._dynamo.variables.higher_order_ops.dynamo_disable_grad(tx), torch.no_grad():
