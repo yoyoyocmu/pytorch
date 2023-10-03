@@ -1,7 +1,10 @@
 # Owner(s): ["oncall: quantization"]
 import copy
 import operator
+import random
 from typing import Any, Optional, Tuple
+
+import numpy as np
 
 import torch
 from torch._export import capture_pre_autograd_graph
@@ -80,6 +83,12 @@ def _get_default_qat_qnnpack_quantization_config():
         is_qat=True,
     )
 
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    return seed
 
 class PT2EQATTestCase(QuantizationTestCase):
     """
@@ -122,14 +131,18 @@ class PT2EQATTestCase(QuantizationTestCase):
         """
         # resetting dynamo cache
         torch._dynamo.reset()
-        MANUAL_SEED = 100
+        MANUAL_SEED = 42
+
+        seed_everything(MANUAL_SEED)
 
         torch.set_printoptions(precision=8)
 
         class PrintMod(torch.nn.Module):
-            def __init__(self, name):
+            def __init__(self, node_name, model_name):
                 super().__init__()
-                self.name = name
+                self.model_name = model_name
+                self.node_name = node_name
+                self.name = model_name + "_print_mod_" + node_name
             def forward(self, x):
                 print("*** PrintMod ", self.name, x.flatten()[:10])
                 return x
@@ -137,10 +150,10 @@ class PT2EQATTestCase(QuantizationTestCase):
         def insert_print_mod(model, node_name, model_name):
             for n in model.graph.nodes:
                 if n.name == node_name:
-                    print_mod_name = model_name + "_print_mod_" + n.name
-                    setattr(model, print_mod_name, PrintMod(print_mod_name))
+                    print_mod = PrintMod(node_name, model_name)
+                    setattr(model, print_mod.name, print_mod)
                     with model.graph.inserting_after(n):
-                        model.graph.call_module(print_mod_name, (n,))
+                        model.graph.call_module(print_mod.name, (n,))
                     break
             model.recompile()
 
@@ -163,6 +176,7 @@ class PT2EQATTestCase(QuantizationTestCase):
                 n.target = torch.ops.aten.cudnn_batch_norm.default
         model_pt2e.recompile()
         model_pt2e.cuda()
+        #model_pt2e.load_state_dict(torch.load("/tmp/pt2_model_batch_0.pth"))
 
         # FX baseline
 
@@ -180,48 +194,39 @@ class PT2EQATTestCase(QuantizationTestCase):
             model_fx, qconfig_mapping, example_inputs, backend_config=backend_config
         )
         model_fx.cuda()
+        #model_fx.load_state_dict(torch.load("/tmp/fx_model_batch_0.pth"))
+        #model_fx = capture_pre_autograd_graph(model_fx, example_inputs[0].cuda())
 
         # DEBUG CODE
 
-        #model_fx.graph.eliminate_dead_code(); model_fx.recompile()
-        #model_pt2e.graph.eliminate_dead_code(); model_pt2e.recompile()
-        #with open("/tmp/model.txt", "w") as f:
-        #    import re
-        #    f.write(re.sub(";(.*)\n", "\n", str(model_pt2e)) + "\n\n\n" + re.sub(";(.*)\n", "\n", str(model_fx)) + "\n")
+        model_fx.graph.eliminate_dead_code(); model_fx.recompile()
+        model_pt2e.graph.eliminate_dead_code(); model_pt2e.recompile()
+        with open("/tmp/model.txt", "w") as f:
+            import re
+            f.write(re.sub(";(.*)\n", "\n", str(model_pt2e)) + "\n\n\n" + re.sub(";(.*)\n", "\n", str(model_fx)) + "\n")
 
-        #insert_print_mod(model_pt2e, "activation_post_process_0", "pt2")
-        #insert_print_mod(model_pt2e, "_param_constant0", "pt2")
-        #insert_print_mod(model_pt2e, "activation_post_process_1", "pt2")
-        #insert_print_mod(model_pt2e, "conv2d_default", "pt2")
-        #insert_print_mod(model_pt2e, "_param_constant2", "pt2")
-        #insert_print_mod(model_pt2e, "_param_constant3", "pt2")
-        #insert_print_mod(model_pt2e, "_tensor_constant1", "pt2")
-        #insert_print_mod(model_pt2e, "_tensor_constant2", "pt2")
-        #insert_print_mod(model_pt2e, "getitem","pt2")
-        #insert_print_mod(model_pt2e, "activation_post_process_2", "pt2")
-
-        #insert_print_mod(model_fx, "activation_post_process_0", "fx")
-        #insert_print_mod(model_fx, "conv", "fx")
-        #insert_print_mod(model_fx, "activation_post_process_1", "fx")
-
-        # exported fx
-        #insert_print_mod(model_fx, "conv2d_default", "fx")
-        #insert_print_mod(model_fx, "_param_constant2", "fx")
-        #insert_print_mod(model_fx, "_param_constant3", "fx")
-        #insert_print_mod(model_fx, "_tensor_constant1", "fx")
-        #insert_print_mod(model_fx, "_tensor_constant2", "fx")
-        #insert_print_mod(model_fx, "_tensor_constant13", "fx")
-        #insert_print_mod(model_fx, "_tensor_constant14", "fx")
-        #insert_print_mod(model_fx, "getitem", "fx")
-
-        #for i in range(0, 15):
+        #for i in range(116, 120):
         #    insert_print_mod(model_pt2e, "activation_post_process_" + str(i), "pt2")
-        #for i in range(0, 7):
-        #    insert_print_mod(model_fx, "activation_post_process_" + str(i), "fx")
+        #for i in range(116, 120):
+        #    insert_print_mod(model_fx, "fused_moving_avg_obs_fake_quant_default_" + str(i), "fx")
+
+        # Verify with actual input
+        #example_inputs = torch.load("/tmp/inputs_batch_0.tensor").cuda()
+        #torch.manual_seed(MANUAL_SEED)
+        #after_prepare_result_pt2e = model_pt2e(example_inputs)
+        #print("\n\n")
+        #torch.manual_seed(MANUAL_SEED)
+        #after_prepare_result_fx = model_fx(example_inputs)
+        #print("\n\n")
+        #print("Actual inputs: ", example_inputs.flatten()[:5])
+        #print("PT2 result: ", after_prepare_result_pt2e.flatten()[:5])
+        #print("FX result: ", after_prepare_result_fx.flatten()[:5])
+        #self.assertEqual(after_prepare_result_pt2e, after_prepare_result_fx)
+        #print("Initial prepare spot check passed for batch 0")
 
         # Verify prepare N times
         for i in range(10):
-            example_inputs = (torch.randn(1, 3, 224, 224).cuda(),)
+            example_inputs = (torch.randn(32, 3, 224, 224).cuda(),)
             torch.manual_seed(MANUAL_SEED)
             after_prepare_result_pt2e = model_pt2e(*example_inputs)
             torch.manual_seed(MANUAL_SEED)

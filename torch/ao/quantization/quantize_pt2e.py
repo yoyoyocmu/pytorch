@@ -175,7 +175,7 @@ def prepare_qat_pt2e(
     # Perform fusion after annotate to avoid quantizing ops in the new
     # subgraph that don't need to be quantized
     # TODO: only fuse if conv and bn are both configured to be quantized
-    #_fuse_conv_bn_qat(model)
+    _fuse_conv_bn_qat(model)
     model = prepare(model, node_name_to_scope, is_qat=True)
     model.meta.update(original_graph_meta)
     model = _disallow_eval_train(model)

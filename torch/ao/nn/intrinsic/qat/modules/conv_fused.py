@@ -96,10 +96,10 @@ class _ConvBnNd(nn.modules.conv._ConvNd, nni._FusedModule):
         return self
 
     def _forward(self, input):
-        return self._my_forward(input)
-        #if self._enable_slow_path_for_better_numerical_stability:
-        #    return self._forward_slow(input)
-        #return self._forward_approximate(input)
+        #return self._my_forward(input)
+        if self._enable_slow_path_for_better_numerical_stability:
+            return self._forward_slow(input)
+        return self._forward_approximate(input)
 
     def _my_forward(self, x):
         wfq = self.weight_fake_quant(self.weight)
