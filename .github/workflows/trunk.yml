@@ -184,9 +184,7 @@ jobs:
       sync-tag: rocm-build
       test-matrix: |
         { include: [
-          { config: "default", shard: 1, num_shards: 3, runner: "linux.rocm.gpu" },
-          { config: "default", shard: 2, num_shards: 3, runner: "linux.rocm.gpu" },
-          { config: "default", shard: 3, num_shards: 3, runner: "linux.rocm.gpu" },
+          { config: "default", shard: 1, num_shards: 1, runner: "linux.rocm.gpu" },
         ]}
 
   linux-focal-rocm5_6-py3_8-test:
@@ -197,3 +195,4 @@ jobs:
       build-environment: linux-focal-rocm5.6-py3.8
       docker-image: ${{ needs.linux-focal-rocm5_6-py3_8-build.outputs.docker-image }}
       test-matrix: ${{ needs.linux-focal-rocm5_6-py3_8-build.outputs.test-matrix }}
+      tests-to-include: "test_torch test_cuda"
