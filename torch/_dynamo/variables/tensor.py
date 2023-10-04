@@ -57,20 +57,6 @@ supported_const_comparison_ops = {
     "!=": operator.ne,
 }
 
-def hook_printing_fn(*grad, real_fn):
-    print("RUNNING HOOK", real_fn)
-    print("Inputs:")
-    for i, inp in enumerate(grad):
-        print(f"    {i}. {inp}")
-    return real_fn(*grad)
-
-def record_hook_fn(tensor, hook_fn):
-    print("RECORD HOOK FN", hook_fn)
-    print("Tensor?", tensor)
-    print("Hook?", hook_fn)
-    tensor.register_hook(functools.partial(hook_printing_fn, real_fn=hook_fn))
-    return tensor
-
 
 class TensorVariable(VariableTracker):
     """A torch.Tensor input or an intermediate value in the FX graph"""
@@ -747,14 +733,14 @@ class TensorVariable(VariableTracker):
                     tx.output.guards.add(src.make_guard(GuardBuilder.ID_MATCH))
 
                 # if not compiled_autograd.compiled_autograd_enabled:
-                    # TODO(voz):
-                    # We can relax this by speculating the callable and ensuring that it doesn't modify arbitrary
-                    # python state.
-                    # We *Must* be in compiled_autograd here because backward hooks can contain anything, and it is unsafe to run
-                    # them in a compiled bwd without re-entering dynamo as compiled_autograd does.
-                    # unimplemented(
-                    #     "Compilation of intermediate hooks requires compiled autograd"
-                    # )
+                #     # TODO(voz):
+                #     # We can relax this by speculating the callable and ensuring that it doesn't modify arbitrary
+                #     # python state.
+                #     # We *Must* be in compiled_autograd here because backward hooks can contain anything, and it is unsafe to run
+                #     # them in a compiled bwd without re-entering dynamo as compiled_autograd does.
+                #     unimplemented(
+                #         "Compilation of intermediate hooks requires compiled autograd"
+                #     )
 
                 # This wraps our user provided fn with a function that intercedes and
                 # uses our `invoke` higher order op to record a hook invocation in bwd graph.
@@ -1188,50 +1174,4 @@ class TypedStorageVariable(VariableTracker):
         args: "List[VariableTracker]",
         kwargs: "Dict[str, VariableTracker]",
     ) -> "VariableTracker":
-        if name == "_resize_":
-            from .builder import wrap_fx_proxy
-            assert len(args) == 1
-            # import os
-            # gpu_id = int(os.environ["LOCAL_RANK"])
-            # if gpu_id == 0:
-                # gm.graph.print_tabular()
-                # print("Resizing?", args[0].value)
-            # self.value._resize_(args[0].value)
-            # return ConstantVariable(None)
-            # resize_proxy = self.proxy._resize_(args[0].value)
-            # resize_proxy.node.meta['example_value'] = None
-            # wrap_fx_proxy(
-            #         tx=tx,
-            #         proxy=resize_proxy,
-            #         example_value=None,
-            #         allow_none=True,
-            #         # **options,
-            # )
-            # return self.original
-            self.value._resize_(args[0].value)
-            # self.as_proxy()._resize_(args[0].value)
-            # self.value().as_proxy()._resize_(args[0])
-            # self.original.as_proxy()._typed_storage()._resize_(args[0].value)
-            # with torch._dynamo.variables.higher_order_ops.dynamo_disable_grad(tx), torch.no_grad():
-            #     print("DYNAMO RESIZE")
-            #     new_t = wrap_fx_proxy(
-            #         tx,
-            #         tx.output.create_proxy(
-            #             "call_method",
-            #             # torch.resize_storage_,
-            #             "resize_storage_",
-            #             *proxy_args_kwargs([self.original] + list(args), {}),
-            #         ),
-            #         allow_none=True,
-            #         example_value=self.original.as_proxy().node.meta['example_value'],
-            #         # **options,
-            #     )
-            #     tx.output.create_proxy(
-            #         "call_function", torch._C._autograd._unsafe_set_version_counter, (new_t.as_proxy(), 0), {}
-            #     )
-            return self
-            self.original.mutable_local = MutableLocal()
-            # return tx.replace_all(self.original, new_t)
-            return new_t
-            # return ConstantVariable(None)
         unimplemented(f"typed_storage method call {name} - NYI")
