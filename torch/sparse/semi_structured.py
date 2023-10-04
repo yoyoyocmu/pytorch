@@ -232,7 +232,36 @@ class SparseSemiStructuredTensor(torch.Tensor):
             f"metadata={self.indices()})"
         )
 
-    __torch_function__ = torch._C._disabled_torch_function_impl
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        """
+        We overload both __torch_function__ and __torch_dispatch__ because when handling F.linear at the op level,
+        PyTorch miscalculates the size of the sparse tensor by a factor of 4, leading to a RuntimeError: Shape mismatch.
+
+        We handle F.linear as a special case and do our nd-> 2d -> nd folding / unfolding ourselves.
+        Another solution is to run with TORCH_FLATTEN_LINEAR_3D=True to avoid this shape mismatch issue.
+        """
+        if func is torch.nn.functional.linear:
+            input_tensor, weight, bias = args
+            shape = input_tensor.shape
+            if isinstance(weight, cls):
+                if cls._FORCE_CUTLASS:
+                    return torch._sparse_semi_structured_linear(
+                        input_tensor, weight.values(), weight.indices(), bias=bias
+                    )
+                else:
+                    return (
+                        torch._cslt_sparse_mm(
+                            weight.compressed_tensor,  # type: ignore[arg-type]
+                            input_tensor.view(-1, shape[-1]).t(),
+                            bias,
+                        )
+                        .t()
+                        .view(*shape[:-1], -1)
+                    )
+        else:
+            # if not the linear function, then compute as usual (fallback to dispatch)
+            return super().__torch_function__(func, types, args, kwargs)
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args, kwargs) -> Any:
@@ -327,17 +356,18 @@ class SparseSemiStructuredTensor(torch.Tensor):
             if isinstance(weight, cls):
                 if cls._FORCE_CUTLASS:
                     return torch._sparse_semi_structured_linear(
-                        input_tensor,
-                        weight.values(),
-                        weight.indices(),
-                        bias=bias
+                        input_tensor, weight.values(), weight.indices(), bias=bias
                     )
                 else:
-                    return torch._cslt_sparse_mm(
-                        weight.compressed_tensor,  # type: ignore[arg-type]
-                        input_tensor.view(-1, shape[-1]).t(),
-                        bias
-                    ).t().view(*shape[:-1], -1)
+                    return (
+                        torch._cslt_sparse_mm(
+                            weight.compressed_tensor,  # type: ignore[arg-type]
+                            input_tensor.view(-1, shape[-1]).t(),
+                            bias,
+                        )
+                        .t()
+                        .view(*shape[:-1], -1)
+                    )
 
         # handle values
         if func is torch.ops.aten.values.default:
@@ -431,4 +461,6 @@ def to_sparse_semi_structured(
                 [-4370, -4370, -4370,  ..., -4370, -4370, -4370]], device='cuda:0',
        dtype=torch.int16))
     """
-    return SparseSemiStructuredTensor(original_tensor, original_shape=original_tensor.shape, transposed=transposed)
+    return SparseSemiStructuredTensor(
+        original_tensor, original_shape=original_tensor.shape, transposed=transposed
+    )
