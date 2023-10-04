@@ -74,7 +74,7 @@ from .utils import (
 from .variables.base import is_side_effect_safe, MutableLocal, typestr, VariableTracker
 from .variables.builder import VariableBuilder, wrap_fx_proxy
 from .variables.builtin import BuiltinVariable
-from .variables.constant import ConstantVariable, EnumVariable
+from .variables.constant import ConstantVariable
 from .variables.ctx_manager import (
     ContextWrappingVariable,
     GenericContextWrappingVariable,
@@ -1303,8 +1303,9 @@ class InstructionTranslatorBase(Checkpointable[InstructionTranslatorGraphState])
         if config.inject_BUILD_SET_unimplemented_TESTING_ONLY:
             unimplemented("missing: BUILD_SET")
         items = self.popn(inst.argval)
-        options = VariableTracker.propagate(items)
-        new_set = SetVariable(items, mutable_local=MutableLocal(), **options)
+        assert all(map(SetVariable.is_valid_key, items))
+        items = set(map(SetVariable.get_key, items))
+        new_set = SetVariable(items, mutable_local=MutableLocal())
         self.push(new_set)
 
     def BUILD_LIST_UNPACK(self, inst, cls=ListVariable):
@@ -1328,12 +1329,7 @@ class InstructionTranslatorBase(Checkpointable[InstructionTranslatorGraphState])
         options = VariableTracker.propagate(items)
         result = dict()
         for k, v in zip(items[::2], items[1::2]):
-            assert (
-                isinstance(k, (ConstantVariable, EnumVariable, BuiltinVariable))
-                or (isinstance(k, TensorVariable) and k.specialized_value is not None)
-                or k.is_python_constant()
-            )
-
+            assert ConstDictVariable.is_valid_key(k)
             result[ConstDictVariable.get_key(k)] = v
         assert len(result) == len(items) / 2
         self.push(

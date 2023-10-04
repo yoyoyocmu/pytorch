@@ -84,7 +84,6 @@ from .dicts import (
     DataClassVariable,
     DefaultDictVariable,
     HFPretrainedConfigVariable,
-    SetVariable,
 )
 from .distributed import (
     DeviceMeshVariable,
@@ -1419,6 +1418,8 @@ def wrap_fx_proxy_cls(
                 example_value, tx=tx, **kwargs
             )
 
+    # REMOVE BEFORE MERGE This assert is here for debugging purposes
+    assert not isinstance(example_value, set)
     if isinstance(example_value, torch.Tensor):
         is_parameter = isinstance(example_value, torch.nn.Parameter)
         should_specialize = options.pop("should_specialize", False)
@@ -1468,7 +1469,7 @@ def wrap_fx_proxy_cls(
     ):
         sizes = [ConstantVariable.create(x) for x in example_value]
         return SizeVariable(sizes, **options)
-    elif isinstance(example_value, (tuple, list, set)):
+    elif isinstance(example_value, (tuple, list)):
         proxy.node.meta["example_value"] = example_value
         unpacked = []
         for i, val in enumerate(example_value):
@@ -1497,8 +1498,6 @@ def wrap_fx_proxy_cls(
             return TupleVariable(unpacked, **options)
         elif istype(example_value, (list, immutable_list)):
             return ListVariable(unpacked, mutable_local=MutableLocal(), **options)
-        elif istype(example_value, set):
-            return SetVariable(unpacked, mutable_local=MutableLocal(), **options)
         else:
             assert example_value.__class__.__module__ == "torch.return_types" or hasattr(
                 example_value, "_fields"
