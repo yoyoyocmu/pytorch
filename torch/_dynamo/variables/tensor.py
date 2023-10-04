@@ -1,3 +1,4 @@
+import functools
 import inspect
 import operator
 import types
@@ -15,10 +16,12 @@ import torch._numpy as tnp
 
 import torch.fx
 import torch.random
+from torch._dynamo import compiled_autograd
 
 from torch.fx.experimental.symbolic_shapes import free_symbols, guard_scalar, SymTypes
 
 from .. import config, variables
+from .._trace_wrapped_higher_order_op import trace_wrapped
 
 from ..exc import unimplemented
 from ..guards import GuardBuilder
@@ -681,13 +684,49 @@ class TensorVariable(VariableTracker):
                 mutable_local=variables.base.MutableLocal(),
                 **options,
             )
+
             if not self.source:
                 # Intermediary
-                unimplemented("Intermediary tensors with registered hooks - NYI")
-            else:
-                assert (
-                    fn_var.source
-                ), "Unreachable - See unimplemented for lambdas above"
+                src = fn_var.source
+                if (
+                    not src
+                    and isinstance(fn_var, variables.functions.FunctoolsPartialVariable)
+                    and fn_var.func.source
+                ):
+                    src = fn_var.func.source
+
+                if src:
+                    tx.output.guards.add(src.make_guard(GuardBuilder.ID_MATCH))
+
+                if not compiled_autograd.compiled_autograd_enabled:
+                    # TODO(voz):
+                    # We can relax this by speculating the callable and ensuring that it doesn't modify arbitrary
+                    # python state.
+                    # We *Must* be in compiled_autograd here because backward hooks can contain anything, and it is unsafe to run
+                    # them in a compiled bwd without re-entering dynamo as compiled_autograd does.
+                    unimplemented(
+                        "Compilation of intermediate hooks requires compiled autograd"
+                    )
+
+                # This wraps our user provided fn with a function that intercedes and
+                # uses our `invoke` higher order op to record a hook invocation in bwd graph.
+                fn = functools.partial(trace_wrapped, fn=fn)
+
+                def _register_hook_trampoline(tensor):
+                    tensor.register_hook(fn)
+                    return tensor
+
+                return wrap_fx_proxy(
+                    tx,
+                    tx.output.create_proxy(
+                        "call_function",
+                        _register_hook_trampoline,
+                        (self.as_proxy(),),
+                        {},
+                    ),
+                    **options,
+                )
+
             tx.output.side_effects.register_hook(self, fn_var, handle_variable)
             return handle_variable
 
