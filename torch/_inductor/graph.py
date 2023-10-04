@@ -7,6 +7,7 @@ import sys
 import time
 from collections import defaultdict, OrderedDict
 from contextlib import contextmanager
+from itertools import count
 from typing import Any, Callable, DefaultDict, Dict, List, Optional, Set, Tuple
 
 import sympy
@@ -216,6 +217,9 @@ class GraphLowering(torch.fx.Interpreter):
         self.cpp_wrapper = cpp_wrapper
         self.aot_mode = aot_mode
         self.graph_id = graph_id
+        self.constant_id = (
+            count()
+        )  # suffix to each constant name to avoid name collisions
         self.scheduler = None
         self.nodes_prefer_channels_last = (
             self.find_nodes_prefer_channels_last() if self.layout_opt else set()
@@ -528,6 +532,11 @@ class GraphLowering(torch.fx.Interpreter):
                 name = f"constant{len(self.constants)}"
             if name[0].isdigit():
                 name = f"constant_{name}"
+            # We may generate a var name for each constant in the codegen.
+            # Let's only keep sane characters.
+            name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+            name = f"{name}_{next(self.constant_id)}"
+            assert name not in self.constants, f"constant {name=} already exists!"
             self.constants[name] = data
             self.constant_reprs[name] = hashlib.sha256(
                 repr(data).encode("utf-8")
@@ -632,7 +641,7 @@ class GraphLowering(torch.fx.Interpreter):
         # this is a constant
         value = getattr(self.module, target)
 
-        if unsupported_output_tensor(value):
+        if config.always_keep_tensor_constants or unsupported_output_tensor(value):
             return self.add_tensor_constant(value, target)
 
         with no_dispatch():
