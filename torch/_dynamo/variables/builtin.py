@@ -43,7 +43,7 @@ from ..utils import (
 )
 from .base import MutableLocal, typestr, VariableTracker
 from .constant import ConstantVariable
-from .dicts import ConstDictVariable, SetVariable
+from .dicts import ConstDictVariable, DictKeys, SetVariable
 from .lists import (
     BaseListVariable,
     ListIteratorVariable,
@@ -1386,7 +1386,7 @@ class BuiltinVariable(VariableTracker):
                 _unimplemented()
             return BaseListVariable.list_compare(tx, op, left, right)
 
-        if isinstance(left, SetVariable):
+        if isinstance(left, (SetVariable, DictKeys)):
             if not type(left) == type(right):  # Mismatch in BaseListVariable subclasses
                 _unimplemented()
             return ConstantVariable.create(

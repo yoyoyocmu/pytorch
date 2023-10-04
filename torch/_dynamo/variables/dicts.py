@@ -2,20 +2,24 @@ import collections
 import dataclasses
 import functools
 import inspect
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 import torch.fx
 
 from .. import variables
-from ..bytecode_transformation import create_call_function, create_instruction
+from ..bytecode_transformation import (
+    create_call_function,
+    create_call_method,
+    create_instruction,
+)
 from ..eval_frame import skip_code
 
 from ..exc import unimplemented
 from ..guards import make_dupe_guard
 from ..source import AttrSource, GlobalWeakRefSource
-from ..utils import global_key_name, istensor
-from .base import MutableLocal, VariableTracker
+from ..utils import global_key_name, istensor, iter_contains
+from .base import VariableTracker
 from .constant import ConstantVariable
 from .tensor import TensorVariable
 
@@ -107,11 +111,10 @@ class ConstDictVariable(VariableTracker):
             )
         elif name == "keys":
             assert not (args or kwargs)
-            return SetVariable(set(val.keys()), mutable_local=MutableLocal())
-
+            return DictKeys(self, **options)
         elif name == "values":
             assert not (args or kwargs)
-            return TupleVariable(list(val.values()), **options)
+            return DictValues(self, **options)
         elif name == "__len__":
             assert not (args or kwargs)
             return ConstantVariable.create(len(self.items), **options)
@@ -357,6 +360,77 @@ class SetVariable(ConstDictVariable):
 
     def getitem_const(self, arg: VariableTracker):
         raise RuntimeError("Illegal to getitem on a set")
+
+
+class DictView(VariableTracker):
+    """
+    Models _PyDictViewObject
+
+    This is an "abstract" class. Subclasses will override kv and the items method
+    """
+
+    kv: Optional[str] = None
+
+    def __init__(self, dv_dict: ConstDictVariable, **kwargs):
+        super().__init__(**kwargs)
+        assert isinstance(dv_dict, ConstDictVariable)
+        self.dv_dict: ConstDictVariable = dv_dict
+
+    def items(self, tx):
+        raise NotImplementedError("Implement this method in a subclass pls")
+
+    def unpack_var_sequence(self, tx):
+        return [x.add_options(self) for x in self.items(tx)]
+
+    def python_type(self):
+        raise NotImplementedError(f"Cannot instantiate {self.__class__}")
+
+    def reconstruct(self, codegen):
+        codegen(self.dv_dict)
+        return [
+            create_instruction("LOAD_METHOD", argval=self.kv),
+            *create_call_method(0),
+        ]
+
+    def call_method(
+        self,
+        tx,
+        name,
+        args: List["VariableTracker"],
+        kwargs: Dict[str, "VariableTracker"],
+    ) -> "VariableTracker":
+        options = VariableTracker.propagate(self, args, kwargs.values())
+        if name == "__contains__":
+            assert len(args) == 1
+            assert not kwargs
+            return iter_contains(self.items(tx), args[0], tx, options)
+        elif name == "__len__":
+            assert not (args or kwargs)
+            return ConstantVariable(len(self.items(tx)), **options)
+
+
+class DictKeys(DictView):
+    kv = "keys"
+    # TODO Implement intersect / union
+    # FIXME Eager allows to use build dicts with tensor as keys. dynamo doesn't
+
+    def items(self, tx):
+        return self.dv_dict.unpack_var_sequence(tx)
+
+    def as_proxy(self):
+        return self.dv_dict.items.keys()
+
+    def as_python_constant(self):
+        return self.dv_dict.items.keys()
+
+
+class DictValues(DictView):
+    # DictValues is an iterable but cannot be compared.
+    # If you need it as proxy or as python constant perhaps it's alright to simply return a tuple
+    kv = "values"
+
+    def items(self, tx):
+        return self.dv_dict.items.values()
 
 
 class DataClassVariable(ConstDictVariable):
